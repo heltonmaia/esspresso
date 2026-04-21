@@ -57,6 +57,24 @@ BANNER_GRADIENT = [MATRIX_GREEN, MATRIX_GREEN, NEON_GREEN, NEON_GREEN, NEON_CYAN
 class Settings:
     baudrate: int = 460800
     start_address: str = "0x1000"
+    fqbn: str = "esp32:esp32:esp32"
+
+
+# Standard offsets for an Arduino-compiled ESP32 sketch triplet.
+ESP32_OFFSETS = {
+    "bootloader": "0x1000",
+    "partitions": "0x8000",
+    "app":        "0x10000",
+}
+
+COMMON_FQBNS = [
+    "esp32:esp32:esp32",
+    "esp32:esp32:esp32s2",
+    "esp32:esp32:esp32s3",
+    "esp32:esp32:esp32c3",
+    "esp32:esp32:esp32c6",
+    "esp32:esp32:esp32h2",
+]
 
 
 # ───────────────────────────── rendering helpers ─────────────────────────────
@@ -77,10 +95,14 @@ def render_banner() -> Panel:
 
 
 def render_status(settings: Settings) -> Text:
+    chip = settings.fqbn.rsplit(":", 1)[-1] if ":" in settings.fqbn else settings.fqbn
     t = Text()
     t.append("▸ ", style=f"bold {NEON_MAGENTA}")
     t.append("BAUD ", style=GREY)
     t.append(str(settings.baudrate), style=f"bold {NEON_YELLOW}")
+    t.append("   ", style=GREY)
+    t.append("CHIP ", style=GREY)
+    t.append(chip, style=f"bold {NEON_MAGENTA}")
     t.append("   ", style=GREY)
     t.append("ADDR ", style=GREY)
     t.append(settings.start_address, style=f"bold {NEON_YELLOW}")
@@ -135,6 +157,28 @@ def list_serial_ports() -> list[str]:
     return sorted(ports)
 
 
+def list_ino_files(directory: str = ".") -> list[str]:
+    return sorted(glob.glob(os.path.join(directory, "*.ino")))
+
+
+def detect_sketch_triplet(firmware_path: str) -> dict[str, str] | None:
+    """If `firmware_path` is an Arduino app binary (`<name>.ino.bin`) and its
+    companion bootloader/partitions binaries exist in the same directory,
+    return {offset: path} for the full three-binary flash. Otherwise None."""
+    if not firmware_path.endswith(".ino.bin"):
+        return None
+    stem = firmware_path[: -len(".bin")]  # <name>.ino
+    bootloader = f"{stem}.bootloader.bin"
+    partitions = f"{stem}.partitions.bin"
+    if os.path.isfile(bootloader) and os.path.isfile(partitions):
+        return {
+            ESP32_OFFSETS["bootloader"]: bootloader,
+            ESP32_OFFSETS["partitions"]: partitions,
+            ESP32_OFFSETS["app"]:        firmware_path,
+        }
+    return None
+
+
 # ───────────────────────────── esptool wrapper ─────────────────────────────
 
 def run_esptool(args: list[str]) -> tuple[int, str, str]:
@@ -144,6 +188,19 @@ def run_esptool(args: list[str]) -> tuple[int, str, str]:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
         return 127, "", "esptool not found in PATH. Install it with: pip install esptool"
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def run_arduino_cli(args: list[str]) -> tuple[int, str, str]:
+    cmd = ["arduino-cli", *args]
+    console.print(Text(f"$ {' '.join(cmd)}", style=f"{GREY} italic"))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return 127, "", (
+            "arduino-cli not found in PATH. Install: "
+            "https://arduino.github.io/arduino-cli/latest/installation/"
+        )
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -157,6 +214,12 @@ def friendly_error_hint(output: str) -> str | None:
         return "Another process is using the port (serial monitor, IDE, another flash). Close it and retry."
     if "esptool not found" in lo:
         return "Install esptool: pip install esptool"
+    if "arduino-cli not found" in lo:
+        return "Install arduino-cli: https://arduino.github.io/arduino-cli/latest/installation/"
+    if "platform not installed" in lo or "no valid dependencies" in lo or "platform esp32:esp32" in lo:
+        return "Install the ESP32 core: arduino-cli core install esp32:esp32 (and add the URL to config first if needed)."
+    if "is not a valid sketch" in lo or "no valid sketch found" in lo:
+        return "Arduino expects the sketch folder name to match the .ino file name. Rename or move accordingly."
     return None
 
 
@@ -287,6 +350,75 @@ def action_erase(settings: Settings) -> None:
     show_esptool_result(rc, out, err, "flash erased", f"Wiped flash on {port}.")
 
 
+def _pick_fqbn(current: str) -> str | None:
+    custom = "[…]  type a custom FQBN"
+    default = current if current in COMMON_FQBNS else COMMON_FQBNS[0]
+    choice = questionary.select(
+        "Select board (FQBN):",
+        choices=[*COMMON_FQBNS, custom],
+        default=default,
+        style=QSTYLE,
+    ).ask()
+    if choice is None:
+        return None
+    if choice != custom:
+        return choice
+    return questionary.text("FQBN:", default=current, style=QSTYLE).ask() or None
+
+
+def action_build(settings: Settings) -> None:
+    inos = list_ino_files(".")
+    if not inos:
+        show_warning("no sketches", "No .ino files in current directory.")
+        return
+    if len(inos) == 1:
+        sketch = inos[0]
+    else:
+        sketch = questionary.select(
+            "Select sketch (.ino):", choices=inos, style=QSTYLE,
+        ).ask()
+        if not sketch:
+            return
+
+    fqbn = _pick_fqbn(settings.fqbn)
+    if not fqbn:
+        return
+    settings.fqbn = fqbn
+
+    sketch_dir = os.path.dirname(os.path.abspath(sketch)) or "."
+    output_dir = os.path.join(sketch_dir, "build")
+    with console.status(
+        Text(f"compiling {os.path.basename(sketch)} for {fqbn}…", style=f"bold {NEON_CYAN}"),
+        spinner="dots",
+    ):
+        rc, out, err = run_arduino_cli([
+            "compile", "--fqbn", fqbn, "--output-dir", output_dir, sketch_dir,
+        ])
+    if rc == 0:
+        stem = os.path.splitext(os.path.basename(sketch))[0]
+        app_bin = os.path.join(output_dir, f"{stem}.ino.bin")
+        show_success("sketch built", f"→ {app_bin}", out)
+    else:
+        body = err.strip() or out.strip() or "Unknown error"
+        show_error("build failed", body, friendly_error_hint(out + err))
+
+
+def _show_triplet_preview(triplet: dict[str, str]) -> None:
+    lines: list[Text] = [Text("Detected Arduino ESP32 sketch binaries:", style=f"bold {NEON_CYAN}"), Text("")]
+    for offset, path in triplet.items():
+        line = Text()
+        line.append(f"  {offset}  ", style=f"bold {NEON_YELLOW}")
+        line.append(path, style=f"{NEON_GREEN}")
+        lines.append(line)
+    console.print(Panel(
+        Group(*lines),
+        border_style=NEON_CYAN,
+        title=f"[bold {NEON_CYAN}][ i ] multi-binary flash[/]",
+        title_align="left",
+        padding=(0, 1),
+    ))
+
+
 def action_write(settings: Settings) -> None:
     port = pick_port()
     if not port:
@@ -294,6 +426,35 @@ def action_write(settings: Settings) -> None:
     firmware = pick_firmware()
     if not firmware:
         return
+
+    triplet = detect_sketch_triplet(firmware)
+    use_triplet = False
+    if triplet:
+        _show_triplet_preview(triplet)
+        opt_triplet = "Flash all 3 binaries at ESP32 offsets (recommended)"
+        opt_single  = "Flash only the selected binary"
+        opt_cancel  = "Cancel"
+        choice = questionary.select(
+            "How to flash?",
+            choices=[opt_triplet, opt_single, opt_cancel],
+            style=QSTYLE,
+        ).ask()
+        if choice is None or choice == opt_cancel:
+            return
+        use_triplet = (choice == opt_triplet)
+
+    if use_triplet:
+        args = ["--port", port, "--baud", str(settings.baudrate), "write_flash"]
+        for offset, path in triplet.items():
+            args.extend([offset, path])
+        with console.status(
+            Text(f"writing 3 binaries to {port}…", style=f"bold {NEON_CYAN}"),
+            spinner="dots",
+        ):
+            rc, out, err = run_esptool(args)
+        show_esptool_result(rc, out, err, "firmware written", f"3 binaries → {port}")
+        return
+
     address = questionary.text(
         "Flash address:", default=settings.start_address, style=QSTYLE,
     ).ask()
@@ -304,8 +465,7 @@ def action_write(settings: Settings) -> None:
         spinner="dots",
     ):
         rc, out, err = run_esptool([
-            "--port", port,
-            "--baud", str(settings.baudrate),
+            "--port", port, "--baud", str(settings.baudrate),
             "write_flash", address, firmware,
         ])
     show_esptool_result(rc, out, err, "firmware written", f"{firmware} → {port} @ {address}")
@@ -328,19 +488,23 @@ def action_settings(settings: Settings) -> None:
     ).ask()
     if addr:
         settings.start_address = addr
+    fqbn = _pick_fqbn(settings.fqbn)
+    if fqbn:
+        settings.fqbn = fqbn
     show_success(
         "settings updated",
-        f"baudrate = {settings.baudrate}   ·   address = {settings.start_address}",
+        f"baud={settings.baudrate}   chip={settings.fqbn}   addr={settings.start_address}",
     )
 
 
 # ───────────────────────────── main loop ─────────────────────────────
 
 ACTIONS = {
-    "[>]  SCAN     — detect connected ESP boards": action_detect,
-    "[x]  ERASE    — wipe flash memory":           action_erase,
-    "[^]  WRITE    — flash firmware binary":       action_write,
-    "[=]  CONFIG   — baudrate, start address":     action_settings,
+    "[>]  SCAN     — detect connected ESP boards":     action_detect,
+    "[c]  BUILD    — compile .ino sketch (arduino-cli)": action_build,
+    "[x]  ERASE    — wipe flash memory":                action_erase,
+    "[^]  WRITE    — flash firmware binary":            action_write,
+    "[=]  CONFIG   — baudrate, address, FQBN":          action_settings,
 }
 EXIT_CHOICE = "[q]  EXIT     — quit the shell"
 

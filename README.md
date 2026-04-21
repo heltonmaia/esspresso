@@ -10,13 +10,22 @@ and translated error hints.
 
 - Arrow-key-navigable main menu (shell-style REPL until you pick *Exit*).
 - Auto-detection of connected boards on `/dev/ttyUSB*` and `/dev/ttyACM*`.
-- Erase flash and write firmware with confirmation prompts.
-- Firmware picker that lists `*.bin` files in the current directory, or lets
-  you type a custom path.
-- Configurable defaults (baudrate, start address) kept in memory for the
+- **Compile Arduino sketches** (`*.ino`) via `arduino-cli` with a board (FQBN)
+  picker for common ESP32 variants.
+- **Smart firmware flashing:** when you pick a `*.ino.bin` that has a sibling
+  `*.ino.bootloader.bin` and `*.ino.partitions.bin`, esspresso offers to flash
+  all three at the canonical ESP32 offsets (`0x1000`/`0x8000`/`0x10000`) in a
+  single `esptool` call. Otherwise falls back to single-binary flash at a
+  configurable address.
+- Erase flash with confirmation.
+- Shell-like firmware picker: navigate directories with arrow keys, descend
+  into subdirs, `.bin` files highlighted in green; optional custom-path fallback
+  with tab completion.
+- Configurable defaults (baudrate, start address, FQBN) kept in memory for the
   session.
 - Human-readable error panels for the usual failure modes: BOOT button not
-  held, serial port permission denied, port busy, `esptool` missing.
+  held, serial port permission denied, port busy, `esptool` missing, ESP32
+  core not installed.
 
 ## Requirements
 
@@ -24,6 +33,15 @@ and translated error hints.
 - Python 3.10 or newer.
 - [`uv`](https://docs.astral.sh/uv/) — recommended, reads the committed
   `uv.lock` for reproducible installs.
+- **Optional, only for the `BUILD` action:**
+  [`arduino-cli`](https://arduino.github.io/arduino-cli/latest/installation/)
+  with the ESP32 core installed:
+
+  ```bash
+  arduino-cli config init --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+  arduino-cli core update-index
+  arduino-cli core install esp32:esp32
+  ```
 
 ## Install
 
@@ -50,6 +68,19 @@ Or, if you prefer an activated shell:
 source .venv/bin/activate
 esspresso
 ```
+
+## Arduino sketch workflow
+
+If your source is a `.ino` sketch (not a pre-built `.bin`):
+
+1. `cd` into the sketch directory (where `YourSketch.ino` lives).
+2. Run `esspresso` (or `uv run esspresso`).
+3. Pick `[c]  BUILD`, choose the board variant (esp32, esp32s3, …) — esspresso
+   calls `arduino-cli compile --output-dir build .`, producing
+   `build/YourSketch.ino.bin` together with the bootloader and partitions.
+4. Pick `[^]  WRITE`, browse into `build/`, select `YourSketch.ino.bin`.
+   esspresso detects the triplet automatically and offers the full 3-binary
+   flash.
 
 ## Serial port permissions
 
