@@ -7,3 +7,7 @@ build/
 .venv/
 venv/
 .env
+
+# Claude Code guidance — local only
+CLAUDE.md
+.claude/
