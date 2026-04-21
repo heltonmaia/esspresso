@@ -4,6 +4,8 @@ An interactive terminal UI for flashing ESP32 boards — a friendly wrapper
 around [`esptool`](https://github.com/espressif/esptool) with menus, colors,
 and translated error hints.
 
+![esspresso main screen](docs/screenshot.svg)
+
 ## Features
 
 - Arrow-key-navigable main menu (shell-style REPL until you pick *Exit*).
